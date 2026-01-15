@@ -89,7 +89,7 @@ export default function WhatsAppConnectWidget() {
                 <div className="bg-white p-4 rounded-lg shadow-sm border">
                     <QRCodeSVG value={qrCode} size={256} />
                 </div>
-                <p className="text-sm text-gray-500 text-center">Open WhatsApp on your phone > Settings > Linked Devices > Link a Device</p>
+                <p className="text-sm text-gray-500 text-center">Open WhatsApp on your phone &gt; Settings &gt; Linked Devices &gt; Link a Device</p>
             </div>
         )}
 
