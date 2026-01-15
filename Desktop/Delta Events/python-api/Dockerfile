@@ -1,22 +1,29 @@
 FROM python:3.11-slim
 
-WORKDIR /build
+WORKDIR /service
 
-# Copy everything from the build context
-COPY . .
+# 1. Copy everything to a temporary location
+COPY . /temp_loader
 
-# Install dependencies
-# We check both locations: root or python-api subfolder
-RUN if [ -f "python-api/requirements.txt" ]; then \
-    pip install --no-cache-dir -r python-api/requirements.txt; \
-    mv python-api/* .; \
+# 2. Universal Setup Script
+# checks if we are running from root (finding python-api dir) or inside subdir
+RUN if [ -d "/temp_loader/python-api/app" ]; then \
+    echo "Found python-api/app (Running from Root)"; \
+    cp -r /temp_loader/python-api/* /service/; \
+    elif [ -d "/temp_loader/app" ]; then \
+    echo "Found /app (Running from Subdir)"; \
+    cp -r /temp_loader/* /service/; \
     else \
-    pip install --no-cache-dir -r requirements.txt; \
+    echo "CRITICAL: Could not find 'app' folder. Listing context:"; \
+    ls -R /temp_loader; \
+    exit 1; \
     fi
 
-# Now valid code should be in /build/app
-# Expose port
+# 3. Install Requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 4. Expose Port
 EXPOSE 8000
 
-# Start command - verify directory structure before starting
-CMD ls -la && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+# 5. Run (with debug verify)
+CMD echo "Contents of /service:" && ls -la && uvicorn app.main:app --host 0.0.0.0 --port $PORT
