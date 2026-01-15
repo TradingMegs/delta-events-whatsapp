@@ -2,12 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy everything first to see what's available (debug)
+COPY . .
 
-# Copy application code
-COPY app ./app
+# Install dependencies (if requirements.txt is in root of build context)
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Expose port
 EXPOSE 8000
