@@ -1,12 +1,16 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+WORKDIR /code
 
-# Assumes we are running INSIDE the python-api directory
-COPY . .
-
-# Install dependencies
+# Copy requirements
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the app package
+COPY app ./app
+
+# Set python path to current directory
+ENV PYTHONPATH=/code
 
 # Expose port
 EXPOSE 8000
