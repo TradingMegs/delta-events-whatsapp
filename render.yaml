@@ -9,7 +9,3 @@ services:
         value: 3001
       - key: NODE_ENV
         value: production
-    disk:
-      name: whatsapp-sessions
-      mountPath: /app/sessions
-      sizeGB: 1
