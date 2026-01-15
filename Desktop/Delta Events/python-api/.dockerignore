@@ -1,0 +1,10 @@
+# Ignore everything by default
+*
+
+# Whitelist what we need
+!requirements.txt
+!app
+!app/**
+!Dockerfile
+!runtime.txt
+!Procfile
