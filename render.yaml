@@ -1,12 +1,15 @@
 services:
   - type: web
-    name: delta-events-whatsapp
-    env: node
+    name: delta-whatsapp
+    runtime: docker
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    region: oregon
     envVars:
       - key: PORT
         value: 3001
       - key: NODE_ENV
         value: production
+    disk:
+      name: whatsapp-sessions
+      mountPath: /app/sessions
+      sizeGB: 1
