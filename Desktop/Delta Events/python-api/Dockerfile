@@ -2,20 +2,35 @@ FROM python:3.11-slim
 
 WORKDIR /service
 
-# Copy all files
-COPY . .
+# Install dependencies FIRST (caching layer)
+# Try both locations
+COPY python-api/requirements.txt ./requirements-subdir.txt
+COPY requirements.txt ./requirements-root.txt
+RUN if [ -f requirements-subdir.txt ]; then \
+    pip install --no-cache-dir -r requirements-subdir.txt; \
+    else \
+    pip install --no-cache-dir -r requirements-root.txt; \
+    fi
 
-# Move python-api files up if we are in root context
-RUN if [ -d "python-api" ]; then cp -r python-api/* .; fi
+# Explicitly copy the app folder
+# We attempt to copy from both potential locations
+COPY python-api/app ./python-api-app
+COPY app ./root-app
 
-# Verify app folder exists
-RUN if [ ! -d "app" ]; then echo "STILL MISSING APP FOLDER"; ls -R; exit 1; fi
+# Move the correct one to /service/app
+RUN if [ -d "python-api-app" ] && [ "$(ls -A python-api-app)" ]; then \
+    mv python-api-app app; \
+    elif [ -d "root-app" ] && [ "$(ls -A root-app)" ]; then \
+    mv root-app app; \
+    else \
+    echo "FATAL: Could not find app code in either location"; \
+    ls -la; \
+    exit 1; \
+    fi
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Clean up
+RUN rm -rf python-api-app root-app requirements-*.txt
 
-# Expose port
 EXPOSE 8000
 
-# Start command
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
