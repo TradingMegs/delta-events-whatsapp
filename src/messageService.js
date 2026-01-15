@@ -1,151 +1,265 @@
 import { sessionManager } from './sessionManager.js';
-import { logger } from './logger.js';
 
 class MessageService {
-    constructor() {
-        this.queues = new Map(); // userId -> { queue: [], processing: boolean }
-        this.DELAY_MS = 7000; // 7 seconds delay between messages
-    }
+  constructor() {
+    this.queues = new Map();
+    this.DELAY_MS = 7000; // 7 seconds delay
+  }
 
-    // --- Message Queueing Logic ---
+  async enqueueMessage(userId, to, content, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this.queues.has(userId)) {
+        this.queues.set(userId, { queue: [], processing: false });
+      }
+      
+      const userQueue = this.queues.get(userId);
+      
+      userQueue.queue.push({
+        to,
+        content,
+        options,
+        resolve,
+        reject
+      });
+      this.processQueue(userId);
+    });
+  }
 
-    async enqueueMessage(userId, to, content, options = {}) {
-        return new Promise((resolve, reject) => {
-            if (!this.queues.has(userId)) {
-                this.queues.set(userId, { queue: [], processing: false });
-            }
-            
-            const userQueue = this.queues.get(userId);
-            
-            userQueue.queue.push({
-                to,
-                content,
-                options,
-                resolve,
-                reject
-            });
-            this.processQueue(userId);
-        });
-    }
+  async processQueue(userId) {
+    if (!this.queues.has(userId)) return;
+    const userQueue = this.queues.get(userId);
+    
+    if (userQueue.processing) return;
+    userQueue.processing = true;
 
-    async processQueue(userId) {
-        if (!this.queues.has(userId)) return;
-        const userQueue = this.queues.get(userId);
-        
-        if (userQueue.processing) return;
-        userQueue.processing = true;
-
-        while (userQueue.queue.length > 0) {
-            const task = userQueue.queue.shift();
-            try {
-                const client = await sessionManager.getClient(userId);
-                if (!client) {
-                    throw new Error("WhatsApp client not connected for user " + userId);
-                }
-
-                // Format number
-                const formattedTo = this.formatNumber(task.to);
-
-                logger.info(`Sending message from ${userId} to ${formattedTo}...`);
-                
-                // whatsapp-web.js: sendMessage
-                const result = await client.sendMessage(formattedTo, task.content);
-                
-                task.resolve({ success: true, messageId: result.id._serialized, result });
-                
-                logger.info(`Message sent to ${formattedTo}`);
-
-            } catch (error) {
-                logger.error(`Failed to send message to ${task.to}:`, error);
-                task.reject(error);
-            }
-
-            // Delay before next message
-            if (userQueue.queue.length > 0) {
-                logger.info(`Waiting ${this.DELAY_MS / 1000}s before next message...`);
-                await new Promise(resolve => setTimeout(resolve, this.DELAY_MS));
-            }
+    while (userQueue.queue.length > 0) {
+      const task = userQueue.queue.shift();
+      try {
+        const socket = await sessionManager.getClient(userId);
+        if (!socket) {
+          throw new Error("WhatsApp client not connected for user " + userId);
         }
 
-        userQueue.processing = false;
-    }
-
-    formatNumber(number) {
-        if (!number) return '';
-        // Remove non-digits
-        let clean = number.replace(/\D/g, '');
-        // If already has suffix, keep it
-        if (number.includes('@c.us') || number.includes('@g.us')) return number;
+        const formattedTo = this.formatNumber(task.to);
+        console.log(`[Baileys] Sending message to ${formattedTo}...`);
         
-        return `${clean}@c.us`; 
-    }
-
-    // --- Public API Methods ---
-
-    async sendMessage(userId, to, message) {
-        return this.enqueueMessage(userId, to, message);
-    }
-
-    async sendBulkMessages(userId, recipients, message) {
-        const promises = recipients.map(to => this.enqueueMessage(userId, to, message));
-        return Promise.allSettled(promises);
-    }
-
-    async getChats(userId) {
-        const client = await sessionManager.getClient(userId);
-        if (!client) throw new Error("Not connected");
+        let result;
+        if (task.options.image) {
+          result = await socket.sendMessage(formattedTo, {
+            image: { url: task.options.image },
+            caption: task.content
+          });
+        } else {
+          result = await socket.sendMessage(formattedTo, {
+            text: task.content
+          });
+        }
         
-        const chats = await client.getChats();
+        task.resolve({ 
+          success: true, 
+          messageId: result.key.id, 
+          result 
+        });
         
-        // Serialize to avoid circular references and 500 errors
-        return chats.map(chat => ({
-            id: chat.id._serialized,
-            name: chat.name || chat.id.user,
-            unreadCount: chat.unreadCount,
-            timestamp: chat.timestamp,
-            isGroup: chat.isGroup,
-            lastMessage: chat.lastMessage ? {
-                body: chat.lastMessage.body,
-                type: chat.lastMessage.type,
-                timestamp: chat.lastMessage.timestamp,
-                fromMe: chat.lastMessage.fromMe
-            } : null
-        }));
+        console.log(`[Baileys] Message sent to ${formattedTo}`);
+
+      } catch (error) {
+        console.error(`[Baileys] Failed to send to ${task.to}:`, error);
+        task.reject(error);
+      }
+
+      // Delay before next message
+      if (userQueue.queue.length > 0) {
+        console.log(`[Baileys] Waiting ${this.DELAY_MS / 1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, this.DELAY_MS));
+      }
     }
 
-    async getChatMessages(userId, chatId, limit = 50) {
-         const client = await sessionManager.getClient(userId);
-         if (!client) throw new Error("Not connected");
-         
-         try {
-             const chat = await client.getChatById(chatId);
-             const messages = await chat.fetchMessages({ limit });
-             
-             // Serialize messages
-             return messages.map(msg => ({
-                 id: msg.id._serialized,
-                 body: msg.body,
-                 type: msg.type,
-                 timestamp: msg.timestamp,
-                 from: msg.from,
-                 to: msg.to,
-                 author: msg.author,
-                 fromMe: msg.fromMe,
-                 hasMedia: msg.hasMedia,
-                 ack: msg.ack
-             }));
-         } catch (error) {
-             logger.error(`Error fetching messages for ${chatId}:`, error);
-             return [];
-         }
-    }
+    userQueue.processing = false;
+  }
 
-    async markAsRead(userId, chatId) {
-        const client = await sessionManager.getClient(userId);
-        if (!client) throw new Error("Not connected");
-        const chat = await client.getChatById(chatId);
-        return await chat.sendSeen();
+  formatNumber(number) {
+    if (!number) return '';
+    
+    // Already formatted
+    if (number.includes('@s.whatsapp.net') || number.includes('@g.us')) {
+      return number;
     }
+    
+    // Clean number
+    let clean = number.replace(/\D/g, '');
+    
+    // Add country code if missing (assuming international format)
+    if (!clean.startsWith('1') && clean.length === 10) {
+      clean = '1' + clean; // US default
+    }
+    
+    return `${clean}@s.whatsapp.net`;
+  }
+
+  async sendMessage(userId, to, message) {
+    return this.enqueueMessage(userId, to, message);
+  }
+
+  async sendBulkMessages(userId, recipients, message) {
+    const promises = recipients.map(to => 
+      this.enqueueMessage(userId, to, message)
+    );
+    return Promise.allSettled(promises);
+  }
+
+  async getChats(userId) {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    // Baileys doesn't have a direct getChats method
+    // We'll return an empty array for now - chats need to be fetched differently
+    console.warn('[Baileys] getChats not fully implemented - use getChatMessages instead');
+    return [];
+  }
+
+  async getChatMessages(userId, chatId, limit = 50) {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    try {
+      // Fetch messages from WhatsApp
+      const messages = await socket.fetchMessagesFromWA(chatId, limit);
+      
+      return messages.map(msg => ({
+        id: msg.key.id,
+        body: msg.message?.conversation || 
+              msg.message?.extendedTextMessage?.text || '',
+        type: Object.keys(msg.message || {})[0] || 'text',
+        timestamp: msg.messageTimestamp * 1000,
+        from: msg.key.remoteJid,
+        to: msg.key.remoteJid,
+        author: msg.key.participant,
+        fromMe: msg.key.fromMe,
+        hasMedia: !!(msg.message?.imageMessage || 
+                     msg.message?.videoMessage ||
+                     msg.message?.documentMessage),
+        ack: msg.status || 0
+      }));
+    } catch (error) {
+      console.error(`[Baileys] Error fetching messages:`, error);
+      return [];
+    }
+  }
+
+  async markAsRead(userId, chatId) {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    // Simplified - mark chat as read
+    await socket.readMessages([{ remoteJid: chatId, id: '*', fromMe: false }]);
+  }
+
+  async getAllGroups(userId = 'admin') {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    // Fetch all group chats
+    const groups = await socket.groupFetchAllParticipating();
+    
+    return Object.values(groups).map(g => ({
+      id: g.id,
+      name: g.subject,
+      desc: g.desc,
+      participants: g.participants?.length || 0
+    }));
+  }
+
+  async getGroupInviteLink(userId, groupId) {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    const code = await socket.groupInviteCode(groupId);
+    return `https://chat.whatsapp.com/${code}`;
+  }
+
+  async isRegistered(userId, phone) {
+    const socket = await sessionManager.getClient(userId);
+    if (!socket) throw new Error("Not connected");
+    
+    const formatted = this.formatNumber(phone);
+    const [result] = await socket.onWhatsApp(formatted);
+    
+    return result?.exists || false;
+  }
+
+  // Event-specific message templates
+  async sendEventInvite(phone, event) {
+    const message = `🎉 *Event Invitation*\n\n` +
+      `You're invited to: *${event.title}*\n\n` +
+      `📅 Date: ${event.date}\n` +
+      `⏰ Time: ${event.time || 'TBA'}\n` +
+      `📍 Location: ${event.location || 'TBA'}\n\n` +
+      `RSVP here: ${event.rsvpLink || 'Contact organizer'}`;
+    
+    return this.sendMessage('admin', phone, message);
+  }
+
+  async sendMagicLink(phone, magicLink, userName) {
+    const message = `👋 Hi ${userName || 'there'}!\n\n` +
+      `Click this link to access your Delta Events account:\n\n` +
+      `🔗 ${magicLink}\n\n` +
+      `This link expires in 15 minutes.`;
+    
+    return this.sendMessage('admin', phone, message);
+  }
+
+  async sendEventReminder(phone, event) {
+    const message = `⏰ *Event Reminder*\n\n` +
+      `Don't forget: *${event.title}*\n\n` +
+      `📅 ${event.date} at ${event.time}\n` +
+      `📍 ${event.location}\n\n` +
+      `See you there!`;
+    
+    return this.sendMessage('admin', phone, message);
+  }
+
+  // Chat actions (simplified for Baileys)
+  async deleteChat() {
+    // Baileys doesn't support deleting chats
+    console.warn('[Baileys] Delete chat not supported');
+  }
+
+  async archiveChat(chatId) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ archive: true }, chatId);
+  }
+
+  async unarchiveChat(chatId) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ archive: false }, chatId);
+  }
+
+  async pinChat(chatId) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ pin: true }, chatId);
+  }
+
+  async unpinChat(chatId) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ pin: false }, chatId);
+  }
+
+  async muteChat(chatId, duration) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ mute: duration || 8 * 60 * 60 * 1000 }, chatId);
+  }
+
+  async unmuteChat(chatId) {
+    const socket = await sessionManager.getClient('admin');
+    if (!socket) throw new Error("Not connected");
+    await socket.chatModify({ mute: null }, chatId);
+  }
 }
 
 export const messageService = new MessageService();

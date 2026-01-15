@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+.env
+.env.local
+.git
+.gitignore
+README.md
+.wwebjs_auth
+.wwebjs_cache
+tokens
+logs/*.log
+sessions/*
+!sessions/.gitkeep
+render.yaml
+fly.toml

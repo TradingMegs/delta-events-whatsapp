@@ -1,195 +1,242 @@
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
-import qrcode from 'qrcode-terminal';
-import { logger } from './logger.js';
+/* eslint-disable react-hooks/rules-of-hooks */
+import makeWASocket, { 
+  DisconnectReason, 
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const logger = pino({ level: 'silent' }); // Silent logger for Baileys
 
 class SessionManager {
   constructor() {
-    this.sessions = new Map(); // userId -> { client, status, qr }
+    this.sessions = new Map(); // userId -> { socket, status, qr, store }
     this.statusListeners = [];
     this.messageListeners = [];
     this.ackListeners = [];
+    
+    // Ensure sessions directory exists
+    const sessionsDir = path.join(__dirname, '..', 'sessions');
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
   }
 
   async getClient(userId) {
     if (!this.sessions.has(userId)) return null;
-    return this.sessions.get(userId).client;
+    return this.sessions.get(userId).socket;
   }
 
   getSession(userId) {
-      return this.sessions.get(userId);
+    return this.sessions.get(userId);
   }
 
-  // Initialize WhatsApp Web Client
   async initialize(userId) {
     if (this.sessions.has(userId)) {
-        const session = this.sessions.get(userId);
-        if (session.status === 'CONNECTED' && session.client) return session;
-        if (session.status === 'INITIALIZING' || session.status === 'QR_RECEIVED') return session;
+      const session = this.sessions.get(userId);
+      if (session.status === 'CONNECTED' && session.socket) return session;
+      if (session.status === 'INITIALIZING') return session;
     }
 
-    logger.info(`Initializing WhatsApp session for user: ${userId}`);
+    console.log(`[Baileys] Initializing session for: ${userId}`);
     
-    // Create client with LocalAuth for session persistence
-    const client = new Client({
-        authStrategy: new LocalAuth({ clientId: userId }),
-        puppeteer: {
-            headless: false,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu'
-            ]
-        }
-    });
-
     // Create session entry
     this.sessions.set(userId, {
-        client: client,
-        status: 'INITIALIZING',
-        qr: null,
-        userId: userId
+      socket: null,
+      status: 'INITIALIZING',
+      qr: null,
+      userId: userId,
+      store: null
     });
+    this.updateStatus(userId, 'INITIALIZING');
 
-    // QR Code event
-    client.on('qr', async (qr) => {
-        logger.info(`QR Code received for ${userId}`);
-        logger.info(`QR String length: ${qr.length}`);
-        
-        // Print to console as ASCII (this works!)
-        qrcode.generate(qr, { small: true });
-        
-        // Send the RAW QR string to frontend
-        // Frontend will use qrcode.react to render it properly
-        if (this.sessions.has(userId)) {
-            const session = this.sessions.get(userId);
-            session.qr = {
-                raw: qr,  // Send raw string
-                timestamp: Date.now()
-            };
-            session.status = 'QR_RECEIVED';
-            this.updateStatus(userId, 'QR_RECEIVED', { qr: qr });  // Send raw string
-        }
-    });
-
-    // Ready event (authenticated and ready)
-    client.on('ready', () => {
-        logger.info(`WhatsApp client ready for ${userId}`);
-        if (this.sessions.has(userId)) {
-            const session = this.sessions.get(userId);
-            session.status = 'CONNECTED';
-            session.qr = null;
-            this.updateStatus(userId, 'CONNECTED');
-        }
-    });
-
-    // Authenticated event
-    client.on('authenticated', () => {
-        logger.info(`WhatsApp authenticated for ${userId}`);
-        if (this.sessions.has(userId)) {
-            const session = this.sessions.get(userId);
-            session.status = 'AUTHENTICATED';
-            this.updateStatus(userId, 'AUTHENTICATED');
-        }
-    });
-
-    // Disconnected event
-    client.on('disconnected', (reason) => {
-        logger.info(`WhatsApp disconnected for ${userId}: ${reason}`);
-        if (this.sessions.has(userId)) {
-            this.updateStatus(userId, 'DISCONNECTED', { reason });
-        }
-    });
-
-    // Message event
-    client.on('message', (message) => {
-        this.notifyMessageListeners(userId, message);
-    });
-
-    // Message acknowledgment event
-    client.on('message_ack', (message, ack) => {
-        this.notifyAckListeners(userId, message.id._serialized, ack);
-    });
-
-    // Initialize the client
     try {
-        await client.initialize();
-    } catch (error) {
-        logger.error(`WhatsApp initialization error for ${userId}:`, error);
-        if (this.sessions.has(userId)) {
-            this.updateStatus(userId, 'ERROR', { error: error.message || error });
-            this.sessions.delete(userId);
+      const sessionPath = path.join(__dirname, '..', 'sessions', userId);
+      
+      // Load auth state from file
+      const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+      
+      // Get latest Baileys version
+      const { version } = await fetchLatestBaileysVersion();
+      
+      // Create WhatsApp socket
+      const socket = makeWASocket({
+        version,
+        auth: state,
+        logger,
+        printQRInTerminal: false,
+        browser: ['Delta Events', 'Chrome', '120.0.0'],
+        syncFullHistory: false,
+        getMessage: async (key) => {
+          // Return message from store if available
+          const session = this.sessions.get(userId);
+          if (session?.store) {
+            const msg = await session.store.loadMessage(key.remoteJid, key.id);
+            return msg?.message || undefined;
+          }
+          return undefined;
         }
-    }
+      });
 
-    return this.sessions.get(userId);
+      const session = this.sessions.get(userId);
+      session.socket = socket;
+
+      // Connection update handler
+      socket.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        // Handle QR code
+        if (qr) {
+          console.log(`[Baileys] QR Code received for ${userId}`);
+          session.qr = {
+            raw: qr,
+            timestamp: Date.now()
+          };
+          session.status = 'QR_RECEIVED';
+          this.updateStatus(userId, 'QR_RECEIVED', { qr });
+        }
+
+        // Handle connection status
+        if (connection === 'close') {
+          const shouldReconnect = (lastDisconnect?.error instanceof Boom)
+            ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+            : true;
+
+          console.log(`[Baileys] Connection closed for ${userId}. Reconnect: ${shouldReconnect}`);
+          
+          if (shouldReconnect) {
+            // Auto-reconnect
+            setTimeout(() => this.initialize(userId), 3000);
+          } else {
+            session.status = 'DISCONNECTED';
+            this.updateStatus(userId, 'DISCONNECTED', { 
+              reason: 'Logged out' 
+            });
+          }
+        } else if (connection === 'open') {
+          console.log(`[Baileys] Connection opened for ${userId}`);
+          session.status = 'CONNECTED';
+          session.qr = null;
+          this.updateStatus(userId, 'CONNECTED');
+        } else if (connection === 'connecting') {
+          console.log(`[Baileys] Connecting for ${userId}`);
+          session.status = 'CONNECTING';
+        }
+      });
+
+      // Credentials update handler
+      socket.ev.on('creds.update', saveCreds);
+
+      // Messages handler
+      socket.ev.on('messages.upsert', ({ messages, type }) => {
+        if (type === 'notify') {
+          messages.forEach(msg => {
+            if (!msg.key.fromMe && msg.message) {
+              this.notifyMessageListeners(userId, msg);
+            }
+          });
+        }
+      });
+
+      // Message receipt update handler
+      socket.ev.on('messages.update', (updates) => {
+        updates.forEach(({ key, update }) => {
+          if (update.status) {
+            this.notifyAckListeners(userId, key.id, update.status);
+          }
+        });
+      });
+
+      return session;
+
+    } catch (error) {
+      console.error(`[Baileys] Initialization error for ${userId}:`, error);
+      if (this.sessions.has(userId)) {
+        this.updateStatus(userId, 'ERROR', { error: error.message });
+        this.sessions.delete(userId);
+      }
+      throw error;
+    }
   }
 
   async logout(userId) {
     if (this.sessions.has(userId)) {
-        const session = this.sessions.get(userId);
-        if (session.client) {
-            try {
-                await session.client.logout();
-                await session.client.destroy();
-            } catch { /* ignore */ }
+      const session = this.sessions.get(userId);
+      if (session.socket) {
+        try {
+          await session.socket.logout();
+        } catch (err) {
+          console.error('Logout error:', err);
         }
-        this.sessions.delete(userId);
-        this.updateStatus(userId, 'DISCONNECTED');
+      }
+      this.sessions.delete(userId);
+      this.updateStatus(userId, 'DISCONNECTED');
+      
+      // Clean up session files
+      const sessionPath = path.join(__dirname, '..', 'sessions', userId);
+      if (fs.existsSync(sessionPath)) {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+      }
     }
   }
 
   async reconnect(userId) {
-      await this.logout(userId);
-      await this.initialize(userId);
+    await this.logout(userId);
+    await this.initialize(userId);
   }
 
   async getConnectionInfo(userId) {
-    if (!this.sessions.has(userId)) return { status: 'DISCONNECTED', connected: false };
+    if (!this.sessions.has(userId)) {
+      return { status: 'DISCONNECTED', connected: false };
+    }
+    
     const session = this.sessions.get(userId);
     
-    if (session.status !== 'CONNECTED' || !session.client) {
-        return { status: session.status, connected: false };
+    if (session.status !== 'CONNECTED' || !session.socket) {
+      return { status: session.status, connected: false };
     }
 
     try {
-        const info = await session.client.info;
-        return {
-            status: 'CONNECTED',
-            connected: true,
-            ready: true,
-            pushname: info.pushname,
-            wid: info.wid._serialized,
-            phone: info.wid.user
-        };
+      const jid = session.socket.user?.id;
+      return {
+        status: 'CONNECTED',
+        connected: true,
+        ready: true,
+        pushname: session.socket.user?.name || 'Unknown',
+        wid: jid,
+        phone: jid?.split('@')[0] || 'Unknown'
+      };
     } catch {
-        return { status: 'CONNECTED', connected: true, ready: true };
+      return { status: 'CONNECTED', connected: true, ready: true };
     }
   }
 
   getStatus(userId) {
-      if (!this.sessions.has(userId)) return { status: 'DISCONNECTED', connected: false };
-      const session = this.sessions.get(userId);
-      return {
-          status: session.status,
-          connected: session.status === 'CONNECTED',
-          qr: session.qr 
-      };
+    if (!this.sessions.has(userId)) {
+      return { status: 'DISCONNECTED', connected: false };
+    }
+    const session = this.sessions.get(userId);
+    return {
+      status: session.status,
+      connected: session.status === 'CONNECTED',
+      qr: session.qr
+    };
   }
 
-  // --- Event Handling ---
-
+  // Event handling
   onStatusChange(callback) {
     this.statusListeners.push(callback);
   }
 
   updateStatus(userId, status, data = {}) {
-     // Broadcast to listeners
-     this.statusListeners.forEach(cb => cb(userId, status, data));
+    this.statusListeners.forEach(cb => cb(userId, status, data));
   }
 
   onMessage(callback) {
@@ -205,7 +252,7 @@ class SessionManager {
   }
 
   notifyAckListeners(userId, msgId, ack) {
-      this.ackListeners.forEach(cb => cb(userId, msgId, ack));
+    this.ackListeners.forEach(cb => cb(userId, msgId, ack));
   }
 }
 
